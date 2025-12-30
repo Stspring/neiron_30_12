@@ -1,0 +1,21 @@
+reg_params = {
+    'learning_rate': 0.018256092238479713,
+    'n_estimators': 260,
+    'max_depth': 3,
+    'min_child_weight': 5,
+    'subsample': 0.9751933727541958,
+    'colsample_bytree': 0.7462352150133582,
+    'lambda': 1,
+    'alpha': 0,
+    'objective': 'reg:squarederror',
+    'eval_metric': 'logloss',
+    'base_score': y.mean(),
+    'booster': 'dart',
+    'random_state': 10,
+    'gamma': 0.9992475012345792
+}
+
+model = xgb.XGBRegressor(**reg_params)
+model.fit(x, y)
+
+predictions = abs(model.predict(test_df))
