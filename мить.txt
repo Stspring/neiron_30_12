@@ -1,0 +1,240 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, RobustScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import xgboost as xgb
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import RandomizedSearchCV
+import lightgbm as lgb
+
+# --- Загрузка данных ---
+X_train = pd.read_csv("X_train.csv", index_col=0).drop(columns=["Id"]) 
+X_test = pd.read_csv("X_test.csv", index_col=0).drop(columns=["Id"])
+y_train = pd.read_csv("y_train.csv", index_col=0)["Price"] 
+y_test = pd.read_csv("y_test.csv", index_col=0)["Price"]  
+
+# --- Расширенный Feature Engineering ---
+def add_features(df):
+    df = df.copy()
+    
+    # Базовые признаки
+    df["HouseAge"] = 2025 - df["YearBuilt"]
+    df["IsNew"] = (df["HouseAge"] <= 5).astype(int)
+    df["IsOld"] = (df["HouseAge"] >= 50).astype(int)
+    
+    # Площадь и комнаты
+    df["TotalRooms"] = df["Bedrooms"] + df["Bathrooms"]
+    df["AreaPerRoom"] = df["Area"] / (df["TotalRooms"] + 1)
+    df["AreaPerBedroom"] = df["Area"] / (df["Bedrooms"] + 1)
+    df["BedroomToBathroom"] = df["Bedrooms"] / (df["Bathrooms"] + 0.5)
+    
+    # Квадратичные признаки
+    df["Area_squared"] = df["Area"] ** 2
+    df["Area_sqrt"] = np.sqrt(df["Area"])
+    df["HouseAge_squared"] = df["HouseAge"] ** 2
+    
+    # Логарифмические признаки
+    df["log_Area"] = np.log1p(df["Area"])
+    df["log_HouseAge"] = np.log1p(df["HouseAge"])
+    
+    # Гараж
+    df["HasGarage"] = (df["Garage"] != "None").astype(int)
+    df["GarageQuality"] = df["Garage"].map({
+        "None": 0, "Single": 1, "Double": 2, "Triple": 3
+    })
+    
+    # Этажи и площадь
+    df["AreaPerFloor"] = df["Area"] / (df["Floors"] + 0.1)
+    df["IsMultiFloor"] = (df["Floors"] > 1).astype(int)
+    
+    # Взаимодействие признаков
+    df["Area_x_Condition"] = df["Area"] * df["Condition"].map({
+        "Poor": 0.7, "Fair": 0.85, "Good": 1.0, "Excellent": 1.2
+    })
+    
+    df["Area_x_Garage"] = df["Area"] * df["GarageQuality"]
+    df["Bedrooms_x_Bathrooms"] = df["Bedrooms"] * df["Bathrooms"]
+    
+    # Категориальные признаки - качество
+    df["ConditionScore"] = df["Condition"].map({
+        "Poor": 1, "Fair": 2, "Good": 3, "Excellent": 4
+    })
+    
+    # Признак "премиальности"
+    df["IsPremium"] = (
+        (df["Area"] > df["Area"].quantile(0.75)) & 
+        (df["ConditionScore"] >= 3)
+    ).astype(int)
+    
+    return df
+
+X_train = add_features(X_train)
+X_test = add_features(X_test)
+
+# --- Обработка выбросов в целевой переменной (IQR метод) ---
+Q1 = y_train.quantile(0.05)
+Q3 = y_train.quantile(0.95)
+IQR = Q3 - Q1
+lower_bound = Q1 - 1.5 * IQR
+upper_bound = Q3 + 1.5 * IQR
+
+# Фильтрация выбросов
+mask = (y_train >= lower_bound) & (y_train <= upper_bound)
+X_train_filtered = X_train[mask]
+y_train_filtered = y_train[mask]
+
+print(f"Удалено выбросов: {len(X_train) - len(X_train_filtered)}")
+
+# --- Определение признаков ---
+categorical_features = ["Location", "Condition", "Garage"]
+numeric_features = [col for col in X_train_filtered.columns if col not in categorical_features]
+
+# --- Предобработка с RobustScaler (лучше для выбросов) ---
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), categorical_features),
+        ("num", RobustScaler(), numeric_features)
+    ]
+)
+
+# --- XGBoost с улучшенными параметрами ---
+xgb_pipe = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("regressor", xgb.XGBRegressor(
+        objective="reg:squarederror",
+        random_state=42,
+        tree_method="hist"
+    ))
+])
+
+xgb_params = {
+    "regressor__n_estimators": [1500, 2000, 2500],
+    "regressor__learning_rate": [0.01, 0.015, 0.02],
+    "regressor__max_depth": [6, 8, 10],
+    "regressor__subsample": [0.8, 0.85, 0.9],
+    "regressor__colsample_bytree": [0.8, 0.85, 0.9],
+    "regressor__min_child_weight": [1, 2, 3],
+    "regressor__gamma": [0, 0.05, 0.1],
+    "regressor__reg_alpha": [0, 0.01, 0.1],
+    "regressor__reg_lambda": [1, 1.5, 2]
+}
+
+print("Обучение XGBoost...")
+xgb_search = RandomizedSearchCV(
+    xgb_pipe, xgb_params, n_iter=40, cv=5,
+    scoring="neg_root_mean_squared_error", random_state=42, n_jobs=-1, verbose=1
+)
+xgb_search.fit(X_train_filtered, y_train_filtered)
+xgb_best = xgb_search.best_estimator_
+
+# --- LightGBM (часто лучше XGBoost) ---
+lgb_pipe = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("regressor", lgb.LGBMRegressor(random_state=42, verbose=-1))
+])
+
+lgb_params = {
+    "regressor__n_estimators": [1500, 2000, 2500],
+    "regressor__learning_rate": [0.01, 0.015, 0.02],
+    "regressor__max_depth": [8, 10, 12],
+    "regressor__num_leaves": [31, 50, 70],
+    "regressor__subsample": [0.8, 0.85, 0.9],
+    "regressor__colsample_bytree": [0.8, 0.85, 0.9],
+    "regressor__min_child_samples": [20, 30, 40],
+    "regressor__reg_alpha": [0, 0.01, 0.1],
+    "regressor__reg_lambda": [0, 0.01, 0.1]
+}
+
+print("Обучение LightGBM...")
+lgb_search = RandomizedSearchCV(
+    lgb_pipe, lgb_params, n_iter=40, cv=5,
+    scoring="neg_root_mean_squared_error", random_state=42, n_jobs=-1, verbose=1
+)
+lgb_search.fit(X_train_filtered, y_train_filtered)
+lgb_best = lgb_search.best_estimator_
+
+# --- RandomForest с улучшенными параметрами ---
+rf_pipe = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("regressor", RandomForestRegressor(random_state=42, n_jobs=-1))
+])
+
+rf_params = {
+    "regressor__n_estimators": [500, 800, 1000],
+    "regressor__max_depth": [20, 25, 30],
+    "regressor__min_samples_split": [2, 5],
+    "regressor__min_samples_leaf": [1, 2],
+    "regressor__max_features": ["sqrt", 0.6, 0.8]
+}
+
+print("Обучение RandomForest...")
+rf_search = RandomizedSearchCV(
+    rf_pipe, rf_params, n_iter=30, cv=5,
+    scoring="neg_root_mean_squared_error", random_state=42, n_jobs=-1, verbose=1
+)
+rf_search.fit(X_train_filtered, y_train_filtered)
+rf_best = rf_search.best_estimator_
+
+# --- Предсказания ---
+xgb_pred = xgb_best.predict(X_test)
+lgb_pred = lgb_best.predict(X_test)
+rf_pred = rf_best.predict(X_test)
+
+# --- Ансамблирование (взвешенное среднее) ---
+# Веса подбираются на основе производительности моделей
+ensemble_pred = 0.4 * xgb_pred + 0.4 * lgb_pred + 0.2 * rf_pred
+
+# Округление
+xgb_pred_rounded = np.round(xgb_pred).astype(int)
+lgb_pred_rounded = np.round(lgb_pred).astype(int)
+rf_pred_rounded = np.round(rf_pred).astype(int)
+ensemble_pred_rounded = np.round(ensemble_pred).astype(int)
+
+# --- Метрики RMSE ---
+xgb_rmse = np.sqrt(mean_squared_error(y_test, xgb_pred_rounded))
+lgb_rmse = np.sqrt(mean_squared_error(y_test, lgb_pred_rounded))
+rf_rmse = np.sqrt(mean_squared_error(y_test, rf_pred_rounded))
+ensemble_rmse = np.sqrt(mean_squared_error(y_test, ensemble_pred_rounded))
+
+print("\n" + "="*60)
+print("РЕЗУЛЬТАТЫ:")
+print("="*60)
+print(f"RMSE XGBoost:      {xgb_rmse:,.2f}")
+print(f"RMSE LightGBM:     {lgb_rmse:,.2f}")
+print(f"RMSE RandomForest: {rf_rmse:,.2f}")
+print(f"RMSE Ансамбль:     {ensemble_rmse:,.2f}")
+print("="*60)
+
+print("\nЛучшие параметры XGBoost:", xgb_search.best_params_)
+print("Лучшие параметры LightGBM:", lgb_search.best_params_)
+print("Лучшие параметры RF:", rf_search.best_params_)
+
+# --- График сравнения ---
+plt.figure(figsize=(14, 7))
+plt.plot(y_test.values, label="Реальные значения", color="blue", linewidth=2)
+plt.plot(xgb_pred_rounded, label=f"XGBoost (RMSE: {xgb_rmse:,.0f})", color="red", linestyle="--", alpha=0.7)
+plt.plot(lgb_pred_rounded, label=f"LightGBM (RMSE: {lgb_rmse:,.0f})", color="orange", linestyle=":", alpha=0.7)
+plt.plot(rf_pred_rounded, label=f"RandomForest (RMSE: {rf_rmse:,.0f})", color="green", linestyle="-.", alpha=0.7)
+plt.plot(ensemble_pred_rounded, label=f"Ансамбль (RMSE: {ensemble_rmse:,.0f})", color="purple", linewidth=2, alpha=0.8)
+plt.title("Сравнение предсказаний моделей с реальными значениями", fontsize=14)
+plt.xlabel("Индекс образца")
+plt.ylabel("Цена")
+plt.legend(loc="best")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# --- Scatter plot для лучшей модели ---
+best_pred = ensemble_pred_rounded
+plt.figure(figsize=(10, 6))
+plt.scatter(y_test, best_pred, alpha=0.5, edgecolors='k', linewidth=0.5)
+plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2)
+plt.xlabel("Реальные значения")
+plt.ylabel("Предсказанные значения")
+plt.title(f"Ансамбль модели: Предсказания vs Реальные значения (RMSE: {ensemble_rmse:,.0f})")
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()

@@ -1,0 +1,139 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import RandomizedSearchCV
+
+import xgboost as xgb
+
+# -------------------------------
+# Загрузка данных
+# -------------------------------
+X_train = pd.read_csv("X_train.csv", index_col=0).drop(columns=["Id"])
+X_test  = pd.read_csv("X_test.csv", index_col=0).drop(columns=["Id"])
+
+y_train = pd.read_csv("y_train.csv", index_col=0)["Price"]
+y_test  = pd.read_csv("y_test.csv", index_col=0)["Price"]
+
+# -------------------------------
+# Feature Engineering
+# -------------------------------
+def add_features(df):
+    df = df.copy()
+    df["HouseAge"] = 2025 - df["YearBuilt"]
+    df["AreaPerRoom"] = df["Area"] / (df["Bedrooms"] + df["Bathrooms"] + 1)
+    df["HasGarage"] = (df["Garage"] != "None").astype(int)
+    return df
+
+X_train = add_features(X_train).drop(columns=["YearBuilt"])
+X_test  = add_features(X_test).drop(columns=["YearBuilt"])
+
+# -------------------------------
+# Логарифмирование таргета
+# -------------------------------
+y_train_log = np.log1p(y_train)
+y_test_log  = np.log1p(y_test)
+
+# -------------------------------
+# Признаки
+# -------------------------------
+categorical_features = ["Location", "Condition", "Garage"]
+numeric_features = [
+    "Area",
+    "Bedrooms",
+    "Bathrooms",
+    "Floors",
+    "HouseAge",
+    "AreaPerRoom",
+    "HasGarage"
+]
+
+# -------------------------------
+# Предобработка
+# -------------------------------
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+        ("num", "passthrough", numeric_features)
+    ]
+)
+
+# -------------------------------
+# XGBoost Pipeline
+# -------------------------------
+xgb_pipe = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("regressor", xgb.XGBRegressor(
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        tree_method="hist",
+        random_state=42,
+        n_jobs=-1
+    ))
+])
+
+# -------------------------------
+# Гиперпараметры (оптимальные)
+# -------------------------------
+xgb_params = {
+    "regressor__n_estimators": [1200, 1600, 2000],
+    "regressor__learning_rate": [0.01, 0.02],
+    "regressor__max_depth": [4, 5, 6],
+    "regressor__subsample": [0.8, 0.9],
+    "regressor__colsample_bytree": [0.8, 0.9],
+    "regressor__min_child_weight": [1, 3],
+    "regressor__gamma": [0, 0.1],
+    "regressor__reg_alpha": [0, 0.1],
+    "regressor__reg_lambda": [1, 1.5]
+}
+
+# -------------------------------
+# Поиск гиперпараметров
+# -------------------------------
+xgb_search = RandomizedSearchCV(
+    estimator=xgb_pipe,
+    param_distributions=xgb_params,
+    n_iter=30,
+    cv=5,
+    scoring="neg_root_mean_squared_error",
+    random_state=42,
+    n_jobs=-1,
+    verbose=1
+)
+
+xgb_search.fit(X_train, y_train_log)
+
+# -------------------------------
+# Лучшая модель
+# -------------------------------
+xgb_best = xgb_search.best_estimator_
+
+# -------------------------------
+# Предсказания (без округления!)
+# -------------------------------
+xgb_pred_log = xgb_best.predict(X_test)
+xgb_pred = np.expm1(xgb_pred_log)
+
+# -------------------------------
+# RMSE
+# -------------------------------
+rmse = np.sqrt(mean_squared_error(y_test, xgb_pred))
+print("Лучшие параметры XGBoost:")
+print(xgb_search.best_params_)
+print(f"\nRMSE XGBoost: {rmse:.0f}")
+
+# -------------------------------
+# График
+# -------------------------------
+plt.figure(figsize=(12, 6))
+plt.plot(y_test.values, label="Реальные значения", color="blue")
+plt.plot(xgb_pred, label="XGBoost предсказания", color="green", linestyle="--")
+plt.title("Сравнение предсказаний XGBoost с реальными значениями")
+plt.ylabel("Цена")
+plt.legend()
+plt.tight_layout()
+plt.show()
